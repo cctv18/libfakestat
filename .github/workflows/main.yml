@@ -12,19 +12,13 @@ jobs:
       - name: 开始编译
         run: |
           cd src
-          aria2c -v
-          curl 2>&1 | tee
-          bison 2>&1 | tee
-          flex 2>&1 | tee
-          make 2>&1 | tee
+          flex --help
           binutils 2>&1 | tee
           git 2>&1 | tee
-          perl 2>&1 | tee
-          gcc 2>&1 | tee
-          python3 2>&1 | tee
-          bc 2>&1 | tee
-          zip 2>&1 | tee
-          unzip 2>&1 | tee
+          perl --help
+          python3 -help
+          python-is-python3 2>&1 | tee
+          bc --help
           ccache 2>&1 | tee
           libssl-dev 2>&1 | tee
           libelf-dev 2>&1 | tee
