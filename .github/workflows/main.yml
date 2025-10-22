@@ -13,6 +13,21 @@ jobs:
         run: |
           cd src
           aria2c -v
+          curl 2>&1 | tee
+          bison 2>&1 | tee
+          flex 2>&1 | tee
+          make 2>&1 | tee
+          binutils 2>&1 | tee
+          git 2>&1 | tee
+          perl 2>&1 | tee
+          gcc 2>&1 | tee
+          python3 2>&1 | tee
+          bc 2>&1 | tee
+          zip 2>&1 | tee
+          unzip 2>&1 | tee
+          ccache 2>&1 | tee
+          libssl-dev 2>&1 | tee
+          libelf-dev 2>&1 | tee
           make
           tar -czf libfakestat.tar.gz *.so
 
