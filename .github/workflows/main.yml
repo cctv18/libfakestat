@@ -12,6 +12,7 @@ jobs:
       - name: 开始编译
         run: |
           cd src
+          aria2c -v
           make
           tar -czf libfakestat.tar.gz *.so
 
