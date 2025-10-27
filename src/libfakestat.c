@@ -5,8 +5,17 @@
  * Copyright (c) 2025 cctv18
  *
  * *Usage example:
- * export FAKESTAT="2025-10-18 14:30:00"
- * LD_PRELOAD=./libfakestat.so ls -l --full-time
+ * [e.g.] export FAKESTAT="2025-10-18 14:30:00"
+ * [e.g.] LD_PRELOAD=./libfakestat.so ls -l --full-time
+ *
+ * [Optional] WORKPATH and NWORKPATH: 
+ * Only apply to paths containing WORKPATH and 
+ * excluding paths containing NWORKPATH (higher priority).
+ * Support wildcard characters (* and?) to match paths.
+ * [e.g.] export WORKPATH="/my/project foo.c"
+ * [e.g.] NWORKPATH="/my/project/out bar.o"
+ * [e.g.] export NWORKPATH="*.o *.so"
+ *
  */
 
 #define _GNU_SOURCE
@@ -20,11 +29,21 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <stdbool.h>
+#include <limits.h>
+#include <fnmatch.h>
 
 // --- Global variables to store our fake time ---
 static time_t g_fake_time_t = 0;
 static struct timespec g_fake_timespec = {0, 0};
 static struct statx_timestamp g_fake_timestamp = {0, 0};
+
+static char **g_workpaths = NULL;
+static int g_workpaths_count = 0;
+static char *g_workpath_strdup = NULL;
+
+static char **g_nworkpaths = NULL;
+static int g_nworkpaths_count = 0;
+static char *g_nworkpath_strdup = NULL;
 
 // --- Reentrancy protection ---
 // (preventing __xstat -> real_xstat -> ... -> __xstat)
@@ -62,6 +81,43 @@ static bool check_missing_real(const char *name, bool missing) {
 }
 #define CHECK_MISSING_REAL(name) \
   check_missing_real(#name, (NULL == real_##name))
+
+static void parse_path_list(const char *env_str, char ***path_list_out, int *count_out, char **strdup_out) {
+    if (!env_str || *env_str == '\0') {
+        *path_list_out = NULL;
+        *count_out = 0;
+        *strdup_out = NULL;
+        return;
+    }
+
+    *strdup_out = strdup(env_str);
+    if (!*strdup_out) {
+        fprintf(stderr, "libfakestat: strdup 内存分配失败\n");
+        *path_list_out = NULL;
+        *count_out = 0;
+        return;
+    }
+
+    *path_list_out = NULL;
+    *count_out = 0;
+    const char *delim = " ";
+    char *p = strtok(*strdup_out, delim);
+
+    while (p) {
+        (*count_out)++;
+        char **new_list = (char**)realloc(*path_list_out, (*count_out) * sizeof(char*));
+        if (!new_list) {
+            fprintf(stderr, "libfakestat: realloc 内存分配失败\n");
+            free(*path_list_out);
+            *path_list_out = NULL;
+            *count_out = 0;
+            return; 
+        }
+        *path_list_out = new_list;
+        (*path_list_out)[*count_out - 1] = p;
+        p = strtok(NULL, delim);
+    }
+}
 
 static void ft_stat_init(void) {
     const char *fakestat_str = getenv("FAKESTAT");
@@ -108,6 +164,12 @@ static void ft_stat_init(void) {
     g_fake_timestamp.tv_sec = g_fake_time_t;
     g_fake_timestamp.tv_nsec = 0;
 
+    // Parsing WORKPATH and NWORKPATH
+    const char *workpath_env = getenv("WORKPATH");
+    const char *nworkpath_env = getenv("NWORKPATH");
+    parse_path_list(workpath_env, &g_workpaths, &g_workpaths_count, &g_workpath_strdup);
+    parse_path_list(nworkpath_env, &g_nworkpaths, &g_nworkpaths_count, &g_nworkpath_strdup);
+
     // Find all real function pointers
     // We set g_dont_fake_stat to prevent dlsym from triggering stat internally.
     g_dont_fake_stat = true;
@@ -117,6 +179,14 @@ static void ft_stat_init(void) {
     real_fxstatat = dlsym(RTLD_NEXT, "__fxstatat");
     real_statx = dlsym(RTLD_NEXT, "statx");
     g_dont_fake_stat = false;
+}
+
+__attribute__((destructor))
+static void ft_stat_cleanup(void) {
+    if (g_workpath_strdup) free(g_workpath_strdup);
+    if (g_nworkpath_strdup) free(g_nworkpath_strdup);
+    if (g_workpaths) free(g_workpaths);
+    if (g_nworkpaths) free(g_nworkpaths);
 }
 
 static void apply_fake_stat(struct stat *stat_buf) {
@@ -133,6 +203,75 @@ static void apply_fake_statx(struct statx *statx_buf) {
     statx_buf->stx_mask |= (STATX_ATIME | STATX_MTIME | STATX_CTIME | STATX_BTIME);
 }
 
+/**
+ * Checking if the files under given path should be faked
+ */
+static bool should_fake_path(const char *path) {
+    if (path == NULL) {
+        if (g_workpaths_count > 0) {
+            return false;
+        }
+        return true;
+    }
+
+    // Get the absolute file path
+    char resolved_buf[PATH_MAX];
+    const char *path_to_check = path; 
+
+    DONT_FAKE_STAT({
+        if (realpath(path, resolved_buf)) {
+            path_to_check = resolved_buf; // If successful, use the absolute path
+        }
+    });
+
+    bool matches_nworkpath = false;
+    bool matches_workpath = false;
+    
+    // Buffer for building fnmatch patterns
+    // +2 for leading and trailing '*', +1 for '\0'
+    char pattern_buf[PATH_MAX + 3];
+
+    // Check NWORKPATH (highest priority)
+    if (g_nworkpaths_count > 0) {
+        for (int i = 0; i < g_nworkpaths_count; i++) {
+            if (g_nworkpaths[i]) {
+                // Automatically wrap path pattern as *pattern*
+                snprintf(pattern_buf, sizeof(pattern_buf), "*%s*", g_nworkpaths[i]);
+                
+                // fnmatch(pattern, string, flags)
+                // flags=0 means '*' , can also match '/'
+                if (fnmatch(pattern_buf, path_to_check, 0) == 0) {
+                    matches_nworkpath = true;
+                    break;
+                }
+            }
+        }
+    }
+    
+    if (matches_nworkpath) {
+        return false; // Match exclusion list, no faking
+    }
+
+    // Check WORKPATH (if NWORKPATH non-match)
+    if (g_workpaths_count > 0) {
+        for (int i = 0; i < g_workpaths_count; i++) {
+             if (g_workpaths[i]) {
+                // Automatically wrap path pattern as *pattern*
+                snprintf(pattern_buf, sizeof(pattern_buf), "*%s*", g_workpaths[i]);
+
+                if (fnmatch(pattern_buf, path_to_check, 0) == 0) {
+                    matches_workpath = true;
+                    break;
+                }
+            }
+        }
+        return matches_workpath; // Fake only if the path matches
+    }
+
+    // 5. Default (no WORKPATH or NWORKPATH matches)
+    return true; 
+}
+
 
 // --- Hijack stat, lstat, fstat, fstatat ---
 
@@ -142,7 +281,7 @@ int __xstat(int ver, const char *path, struct stat *stat_buf) {
     if (!CHECK_MISSING_REAL(xstat)) return -1;
     int ret;
     DONT_FAKE_STAT(ret = real_xstat(ver, path, stat_buf));
-    if (ret == 0 && !g_dont_fake_stat) {
+    if (ret == 0 && !g_dont_fake_stat && should_fake_path(path)) {
         apply_fake_stat(stat_buf);
     }
     return ret;
@@ -154,7 +293,7 @@ int __lxstat(int ver, const char *path, struct stat *stat_buf) {
     if (!CHECK_MISSING_REAL(lxstat)) return -1;
     int ret;
     DONT_FAKE_STAT(ret = real_lxstat(ver, path, stat_buf));
-    if (ret == 0 && !g_dont_fake_stat) {
+    if (ret == 0 && !g_dont_fake_stat && should_fake_path(path)) {
         apply_fake_stat(stat_buf);
     }
     return ret;
@@ -166,7 +305,7 @@ int __fxstat(int ver, int fd, struct stat *stat_buf) {
     if (!CHECK_MISSING_REAL(fxstat)) return -1;
     int ret;
     DONT_FAKE_STAT(ret = real_fxstat(ver, fd, stat_buf));
-    if (ret == 0 && !g_dont_fake_stat) {
+    if (ret == 0 && !g_dont_fake_stat && should_fake_path(NULL)) {
         apply_fake_stat(stat_buf);
     }
     return ret;
@@ -178,7 +317,7 @@ int __fxstatat(int ver, int dirfd, const char *path, struct stat *stat_buf, int 
     if (!CHECK_MISSING_REAL(fxstatat)) return -1;
     int ret;
     DONT_FAKE_STAT(ret = real_fxstatat(ver, dirfd, path, stat_buf, flags));
-    if (ret == 0 && !g_dont_fake_stat) {
+    if (ret == 0 && !g_dont_fake_stat && should_fake_path(path)) {
         apply_fake_stat(stat_buf);
     }
     return ret;
@@ -190,7 +329,7 @@ int statx(int dirfd, const char *pathname, int flags, unsigned int mask, struct 
     if (!CHECK_MISSING_REAL(statx)) return -1;
     int ret;
     DONT_FAKE_STAT(ret = real_statx(dirfd, pathname, flags, mask, statxbuf));
-    if (ret == 0 && !g_dont_fake_stat) {
+    if (ret == 0 && !g_dont_fake_stat && should_fake_path(pathname)) {
         apply_fake_statx(statxbuf);
     }
     return ret;
