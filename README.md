@@ -3,8 +3,11 @@
 ## 原理
 通过注入 Linux/Unix 应用程序，劫持应用程序获取创建时间`(btime/crtime)`、访问时间`(atime)`、修改时间`(mtime)`、变更时间`(ctime)`的获取函数，使程序查询文件时间戳时强行返回我们自行设置的时间戳，在不对文件系统实际时间戳进行底层修改操作的情况下完成安全、简便的时间戳伪装。
 ## 用法
-- 编译：拉取源码仓库后进入`src`目录，运行`make`指令即可进行编译，若需要直接安装至系统可运行`make install`；同时本项目也提供了利用 GitHub Action 进行云编译的工作流脚本。
-- 注入程序：通过`FAKESTAT`变量指定需要伪造的文件时间戳（格式为`YYYY-MM-DD hh:mm:ss`），并通过`LD_PRELOAD=/your/lib/path/libfakestat.so`指令加载so。  
+- **编译**
+- 拉取源码仓库后进入`src`目录，运行`make`指令即可进行编译，若需要直接安装至系统可运行`make install`；同时本项目也提供了利用 GitHub Action 进行云编译的工作流脚本。
+- **注入程序**
+- 通过`FAKESTAT`变量指定需要伪造的文件时间戳（格式为`YYYY-MM-DD hh:mm:ss`），并通过`LD_PRELOAD=/your/lib/path/libfakestat.so`指令加载so。  
+- **注：若不手动指定`FAKESTAT`，则时间默认为`1970-01-01 00:00:00`**。
 - 使用例：  
 `FAKESTAT="2025-05-25 11:45:14" LD_PRELOAD=./libfakestat.so stat ./*`  
 - 输出效果：
@@ -47,10 +50,20 @@
 变更时间：1919-08-10 00:00:00.000000000 +0900
 创建时间：1919-08-10 00:00:00.000000000 +0900
 ```
-- 同时，`libfakestat`可以与`libfaketime`合用，使用例如下：  
+- **文件读取劫持**
+- 可以劫持指定文件大小/内容/哈希校验/时间戳等读取，劫持到某个指定的目标文件，且不影响可执行文件自身运行（即读取被劫持文件会被指向至劫持目标，但执行被劫持文件执行的是其自身），支持完整/部分/相对路径匹配及通配符匹配。
+- 指令用法：定义环境变量`HIJACK_TARGET`——被劫持目标，`HIJACK_FAKE`——重定向目标；若有特殊场景，需要使被劫持目标读取到重定向目标的真实时间戳（绕过全局定义的统一虚假时间戳），则可以额外定义环境变量`HIJACK_PRIO_TIMESTAMP="1"`。
+- 使用例：
+- 单组映射劫持：
+- `HIJACK_TARGET="$(pwd)/clang" HIJACK_FAKE="/home/ubuntu/bin/clang" LD_PRELOAD="./libfakestat.so stat ./clang`
+- 多组映射劫持：
+- `HIJACK_TARGET_1="$(pwd)/clang" HIJACK_FAKE_1="/home/ubuntu/bin/clang" HIJACK_TARGET_2="$(pwd)/ld.lld" HIJACK_FAKE_2="/home/ubuntu/bin/ld.lld" LD_PRELOAD="./libfakestat.so stat ./clang`
+- 多组映射劫持以`_n`的形式对`HIJACK_TARGET`和`HIJACK_FAKE`进行分组，最高支持1024组，且编号越小的映射规则优先级越高。
+- **与`libfaketime`合用**
+- 使用例如下：  
 `FAKETIME="@2024-05-26 12:34:56" FAKESTAT="2025-05-25 11:45:14" LD_PRELOAD="./libfakestat.so ./libfaketime.so" bash build.sh`
-#### 注：若不手动指定`FAKESTAT`，则时间默认为`1970-01-01 00:00:00`。
-- 作用/排除路径控制：分别通过`WORKPATH`和`NWORKPATH`两个变量来控制，多个路径用空格分隔，路径可以使用通配符，且`NWORKPATH`优先级高于`WORKPATH`。
+- **作用/排除路径控制**
+- 分别通过`WORKPATH`和`NWORKPATH`两个变量来控制，多个路径用空格分隔，路径可以使用通配符，且`NWORKPATH`优先级高于`WORKPATH`。
 - 示例：
 - 作用路径包含所有文件名/路径中含有.c和cc的文件而排除包含.orig的文件：
 - `WORKPATH="cc *.c" NWORKPATH="*.orig" FAKESTAT="2025-10-18 14:30:00" LD_PRELOAD=./libfakestat.so stat ./*`
