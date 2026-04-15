@@ -110,7 +110,20 @@ static real_openat64_f_t real_openat64 = NULL;
 static real_fopen_f_t real_fopen = NULL;
 static real_fopen64_f_t real_fopen64 = NULL;
 
-static pthread_once_t g_init_once = PTHREAD_ONCE_INIT;
+// Introduced initialization state flag for quick lock-free checking
+static bool g_initialized = false;
+
+// Added forward declaration of the initialization function for macros to use
+static void ft_stat_init(void);
+
+// Using macros to encapsulate efficient initialization checks without locks
+// Using __builtin_expect to indicate to the compiler that the condition is false (i.e., initialization is complete) in most cases, which greatly optimizes instruction branch prediction
+#define ENSURE_INIT() \
+    do { \
+        if (__builtin_expect(!g_initialized, 0)) { \
+            ft_stat_init(); \
+        } \
+    } while(0)
 
 static bool check_missing_real(const char *name, bool missing) {
     if (missing) {
@@ -158,7 +171,13 @@ static void parse_path_list(const char *env_str, char ***path_list_out, int *cou
     }
 }
 
+// Using __attribute__((constructor)), which enables automatic single-threaded initialization to be executed at the moment when the dynamic library is loaded
+__attribute__((constructor))
 static void ft_stat_init(void) {
+    // Coordinate with the macro above to prevent abnormal reentrance from causing repeated initialization
+    if (g_initialized) return;
+    g_initialized = true;
+
     const char *fakestat_str = getenv("FAKESTAT");
     g_fake_time_t = 0; // --> Default time: 1970-01-01 00:00:00
 
@@ -387,7 +406,7 @@ static const char* resolve_hijack_path(const char *path, bool *is_hijacked) {
 // --- Hijack open, openat ---
 
 int open(const char *pathname, int flags, ...) {
-    pthread_once(&g_init_once, ft_stat_init);
+    ENSURE_INIT();
     if (!CHECK_MISSING_REAL(open)) return -1;
 
     bool is_hijacked;
@@ -407,7 +426,7 @@ int open(const char *pathname, int flags, ...) {
 }
 
 int open64(const char *pathname, int flags, ...) {
-    pthread_once(&g_init_once, ft_stat_init);
+    ENSURE_INIT();
     if (!CHECK_MISSING_REAL(open64)) return -1;
 
     bool is_hijacked;
@@ -427,7 +446,7 @@ int open64(const char *pathname, int flags, ...) {
 }
 
 int openat(int dirfd, const char *pathname, int flags, ...) {
-    pthread_once(&g_init_once, ft_stat_init);
+    ENSURE_INIT();
     if (!CHECK_MISSING_REAL(openat)) return -1;
 
     bool is_hijacked;
@@ -447,7 +466,7 @@ int openat(int dirfd, const char *pathname, int flags, ...) {
 }
 
 int openat64(int dirfd, const char *pathname, int flags, ...) {
-    pthread_once(&g_init_once, ft_stat_init);
+    ENSURE_INIT();
     if (!CHECK_MISSING_REAL(openat64)) return -1;
 
     bool is_hijacked;
@@ -469,7 +488,7 @@ int openat64(int dirfd, const char *pathname, int flags, ...) {
 // --- Hijack fopen, fopen64 ---
 
 FILE *fopen(const char *pathname, const char *mode) {
-    pthread_once(&g_init_once, ft_stat_init);
+    ENSURE_INIT();
     if (!CHECK_MISSING_REAL(fopen)) return NULL;
 
     bool is_hijacked;
@@ -481,7 +500,7 @@ FILE *fopen(const char *pathname, const char *mode) {
 }
 
 FILE *fopen64(const char *pathname, const char *mode) {
-    pthread_once(&g_init_once, ft_stat_init);
+    ENSURE_INIT();
     if (!CHECK_MISSING_REAL(fopen64)) return NULL;
 
     bool is_hijacked;
@@ -496,7 +515,7 @@ FILE *fopen64(const char *pathname, const char *mode) {
 
 // Hijack stat() -> __xstat()
 int __xstat(int ver, const char *path, struct stat *stat_buf) {
-    pthread_once(&g_init_once, ft_stat_init);
+    ENSURE_INIT();
     if (!CHECK_MISSING_REAL(xstat)) return -1;
     
     bool is_hijacked;
@@ -515,7 +534,7 @@ int __xstat(int ver, const char *path, struct stat *stat_buf) {
 
 // Hijack lstat() -> __lxstat()
 int __lxstat(int ver, const char *path, struct stat *stat_buf) {
-    pthread_once(&g_init_once, ft_stat_init);
+    ENSURE_INIT();
     if (!CHECK_MISSING_REAL(lxstat)) return -1;
 
     bool is_hijacked;
@@ -535,7 +554,7 @@ int __lxstat(int ver, const char *path, struct stat *stat_buf) {
 // Hijack fstat() -> __fxstat()
 // Notice: file content hijack handled by open/openat wrapper.
 int __fxstat(int ver, int fd, struct stat *stat_buf) {
-    pthread_once(&g_init_once, ft_stat_init);
+    ENSURE_INIT();
     if (!CHECK_MISSING_REAL(fxstat)) return -1;
     int ret;
     DONT_FAKE_STAT(ret = real_fxstat(ver, fd, stat_buf));
@@ -547,7 +566,7 @@ int __fxstat(int ver, int fd, struct stat *stat_buf) {
 
 // Hijack fstatat() -> __fxstatat()
 int __fxstatat(int ver, int dirfd, const char *path, struct stat *stat_buf, int flags) {
-    pthread_once(&g_init_once, ft_stat_init);
+    ENSURE_INIT();
     if (!CHECK_MISSING_REAL(fxstatat)) return -1;
 
     bool is_hijacked;
@@ -566,7 +585,7 @@ int __fxstatat(int ver, int dirfd, const char *path, struct stat *stat_buf, int 
 
 // --- Hijack statx (to hijack crtime)---
 int statx(int dirfd, const char *pathname, int flags, unsigned int mask, struct statx *statxbuf) {
-    pthread_once(&g_init_once, ft_stat_init);
+    ENSURE_INIT();
     if (!CHECK_MISSING_REAL(statx)) return -1;
 
     bool is_hijacked;
