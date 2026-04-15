@@ -18,8 +18,14 @@
  * * [Optional] HIJACK_TARGET, HIJACK_FAKE and HIJACK_PRIO_TIMESTAMP:
  * Hijack file read operations (content, hash, size, etc.) to a fake file.
  * Won't affect binary execution (handled by kernel).
+ * Single mapping support:
  * [e.g.] export HIJACK_TARGET="secret.txt"
  * [e.g.] export HIJACK_FAKE="/tmp/fake_data.txt"
+ * Multi-mapping support (smaller index has higher priority):
+ * [e.g.] export HIJACK_TARGET_1="binary1"
+ * [e.g.] export HIJACK_FAKE_1="/tmp/fake_dummy1"
+ * [e.g.] export HIJACK_TARGET_2="binary2"
+ * [e.g.] export HIJACK_FAKE_2="/tmp/fake_dummy2"
  * [e.g.] export HIJACK_PRIO_TIMESTAMP="1" (If 1, returns the real timestamp of HIJACK_FAKE instead of FAKESTAT)
  */
 
@@ -52,9 +58,17 @@ static char **g_nworkpaths = NULL;
 static int g_nworkpaths_count = 0;
 static char *g_nworkpath_strdup = NULL;
 
-// --- Hijack Read Targets ---
-static char *g_hijack_target = NULL;
-static char *g_hijack_fake = NULL;
+// --- Hijack Read Targets (Multi-mapping support) ---
+#define MAX_HIJACK_MAPPINGS 1024
+
+typedef struct {
+    const char *target;
+    const char *fake;
+} HijackMapping;
+
+static HijackMapping g_hijack_mappings[MAX_HIJACK_MAPPINGS];
+static int g_hijack_mapping_count = 0;
+
 static bool g_hijack_prio_timestamp = false;
 
 // --- Reentrancy protection ---
@@ -100,7 +114,6 @@ static pthread_once_t g_init_once = PTHREAD_ONCE_INIT;
 
 static bool check_missing_real(const char *name, bool missing) {
     if (missing) {
-        // fprintf(stderr, "libfakestat: problem: original %s not found.\n", name);
         return false;
     }
     return true;
@@ -197,11 +210,39 @@ static void ft_stat_init(void) {
     parse_path_list(nworkpath_env, &g_nworkpaths, &g_nworkpaths_count, &g_nworkpath_strdup);
 
     // Parsing HIJACK vars
-    g_hijack_target = getenv("HIJACK_TARGET");
-    g_hijack_fake = getenv("HIJACK_FAKE");
     const char* prio_env = getenv("HIJACK_PRIO_TIMESTAMP");
     if (prio_env && (strcmp(prio_env, "1") == 0 || strcasecmp(prio_env, "true") == 0)) {
         g_hijack_prio_timestamp = true;
+    }
+
+    g_hijack_mapping_count = 0;
+    const char *t, *f;
+
+    // 1. Single Mapping (Legacy) - Highest priority
+    t = getenv("HIJACK_TARGET");
+    f = getenv("HIJACK_FAKE");
+    if (t && f && g_hijack_mapping_count < MAX_HIJACK_MAPPINGS) {
+        g_hijack_mappings[g_hijack_mapping_count].target = t;
+        g_hijack_mappings[g_hijack_mapping_count].fake = f;
+        g_hijack_mapping_count++;
+    }
+
+    // 2. Multi-mappings: HIJACK_TARGET_i, HIJACK_FAKE_i (修改为下划线格式)
+    char target_key[1024];
+    char fake_key[1024];
+    for (int i = 1; i < MAX_HIJACK_MAPPINGS; i++) {
+        snprintf(target_key, sizeof(target_key), "HIJACK_TARGET_%d", i);
+        snprintf(fake_key, sizeof(fake_key), "HIJACK_FAKE_%d", i);
+        
+        t = getenv(target_key);
+        f = getenv(fake_key);
+        
+        // If both exist, add to mappings array
+        if (t && f && g_hijack_mapping_count < MAX_HIJACK_MAPPINGS) {
+            g_hijack_mappings[g_hijack_mapping_count].target = t;
+            g_hijack_mappings[g_hijack_mapping_count].fake = f;
+            g_hijack_mapping_count++;
+        }
     }
 
     // Find all real function pointers
@@ -276,11 +317,7 @@ static bool should_fake_path(const char *path) {
     if (g_nworkpaths_count > 0) {
         for (int i = 0; i < g_nworkpaths_count; i++) {
             if (g_nworkpaths[i]) {
-                // Automatically wrap path pattern as *pattern*
                 snprintf(pattern_buf, sizeof(pattern_buf), "*%s*", g_nworkpaths[i]);
-                
-                // fnmatch(pattern, string, flags)
-                // flags=0 means '*' , can also match '/'
                 if (fnmatch(pattern_buf, path_to_check, 0) == 0) {
                     matches_nworkpath = true;
                     break;
@@ -290,23 +327,21 @@ static bool should_fake_path(const char *path) {
     }
     
     if (matches_nworkpath) {
-        return false; // Match exclusion list, no faking
+        return false; 
     }
 
     // Check WORKPATH (if NWORKPATH non-match)
     if (g_workpaths_count > 0) {
         for (int i = 0; i < g_workpaths_count; i++) {
              if (g_workpaths[i]) {
-                // Automatically wrap path pattern as *pattern*
                 snprintf(pattern_buf, sizeof(pattern_buf), "*%s*", g_workpaths[i]);
-
                 if (fnmatch(pattern_buf, path_to_check, 0) == 0) {
                     matches_workpath = true;
                     break;
                 }
             }
         }
-        return matches_workpath; // Fake only if the path matches
+        return matches_workpath; 
     }
 
     // 5. Default (no WORKPATH or NWORKPATH matches)
@@ -314,11 +349,11 @@ static bool should_fake_path(const char *path) {
 }
 
 /**
- * Resolve target path to fake path if it matches HIJACK_TARGET
+ * Resolve target path to fake path by matching through mappings
  */
 static const char* resolve_hijack_path(const char *path, bool *is_hijacked) {
     *is_hijacked = false;
-    if (!path || !g_hijack_target || !g_hijack_fake) {
+    if (!path || g_hijack_mapping_count == 0) {
         return path;
     }
 
@@ -336,11 +371,13 @@ static const char* resolve_hijack_path(const char *path, bool *is_hijacked) {
     });
 
     char pattern_buf[PATH_MAX + 3];
-    snprintf(pattern_buf, sizeof(pattern_buf), "*%s*", g_hijack_target);
     
-    if (fnmatch(pattern_buf, path_to_check, 0) == 0) {
-        *is_hijacked = true;
-        return g_hijack_fake;
+    for (int i = 0; i < g_hijack_mapping_count; i++) {
+        snprintf(pattern_buf, sizeof(pattern_buf), "*%s*", g_hijack_mappings[i].target);
+        if (fnmatch(pattern_buf, path_to_check, 0) == 0) {
+            *is_hijacked = true;
+            return g_hijack_mappings[i].fake;
+        }
     }
 
     return path;
@@ -503,8 +540,6 @@ int __fxstat(int ver, int fd, struct stat *stat_buf) {
     int ret;
     DONT_FAKE_STAT(ret = real_fxstat(ver, fd, stat_buf));
     if (ret == 0 && !g_dont_fake_stat && should_fake_path(NULL)) {
-        // Since fxstat uses fd, we cannot easily check path matching without fd mapping tracking.
-        // We apply standard FAKESTAT as a fallback for standard fd queries.
         apply_fake_stat(stat_buf);
     }
     return ret;
