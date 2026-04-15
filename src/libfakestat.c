@@ -15,7 +15,12 @@
  * [e.g.] export WORKPATH="/my/project foo.c"
  * [e.g.] NWORKPATH="/my/project/out bar.o"
  * [e.g.] export NWORKPATH="*.o *.so"
- *
+ * * [Optional] HIJACK_TARGET, HIJACK_FAKE and HIJACK_PRIO_TIMESTAMP:
+ * Hijack file read operations (content, hash, size, etc.) to a fake file.
+ * Won't affect binary execution (handled by kernel).
+ * [e.g.] export HIJACK_TARGET="secret.txt"
+ * [e.g.] export HIJACK_FAKE="/tmp/fake_data.txt"
+ * [e.g.] export HIJACK_PRIO_TIMESTAMP="1" (If 1, returns the real timestamp of HIJACK_FAKE instead of FAKESTAT)
  */
 
 #define _GNU_SOURCE
@@ -31,6 +36,8 @@
 #include <stdbool.h>
 #include <limits.h>
 #include <fnmatch.h>
+#include <fcntl.h>
+#include <stdarg.h>
 
 // --- Global variables to store our fake time ---
 static time_t g_fake_time_t = 0;
@@ -44,6 +51,11 @@ static char *g_workpath_strdup = NULL;
 static char **g_nworkpaths = NULL;
 static int g_nworkpaths_count = 0;
 static char *g_nworkpath_strdup = NULL;
+
+// --- Hijack Read Targets ---
+static char *g_hijack_target = NULL;
+static char *g_hijack_fake = NULL;
+static bool g_hijack_prio_timestamp = false;
 
 // --- Reentrancy protection ---
 // (preventing __xstat -> real_xstat -> ... -> __xstat)
@@ -64,11 +76,25 @@ typedef int (*real_fxstat_f_t)(int ver, int fd, struct stat *stat_buf);
 typedef int (*real_fxstatat_f_t)(int ver, int dirfd, const char *path, struct stat *stat_buf, int flags);
 typedef int (*real_statx_f_t)(int dirfd, const char *pathname, int flags, unsigned int mask, struct statx *statxbuf);
 
+typedef int (*real_open_f_t)(const char *pathname, int flags, ...);
+typedef int (*real_open64_f_t)(const char *pathname, int flags, ...);
+typedef int (*real_openat_f_t)(int dirfd, const char *pathname, int flags, ...);
+typedef int (*real_openat64_f_t)(int dirfd, const char *pathname, int flags, ...);
+typedef FILE *(*real_fopen_f_t)(const char *pathname, const char *mode);
+typedef FILE *(*real_fopen64_f_t)(const char *pathname, const char *mode);
+
 static real_xstat_f_t real_xstat = NULL;
 static real_lxstat_f_t real_lxstat = NULL;
 static real_fxstat_f_t real_fxstat = NULL;
 static real_fxstatat_f_t real_fxstatat = NULL;
 static real_statx_f_t real_statx = NULL;
+
+static real_open_f_t real_open = NULL;
+static real_open64_f_t real_open64 = NULL;
+static real_openat_f_t real_openat = NULL;
+static real_openat64_f_t real_openat64 = NULL;
+static real_fopen_f_t real_fopen = NULL;
+static real_fopen64_f_t real_fopen64 = NULL;
 
 static pthread_once_t g_init_once = PTHREAD_ONCE_INIT;
 
@@ -170,6 +196,14 @@ static void ft_stat_init(void) {
     parse_path_list(workpath_env, &g_workpaths, &g_workpaths_count, &g_workpath_strdup);
     parse_path_list(nworkpath_env, &g_nworkpaths, &g_nworkpaths_count, &g_nworkpath_strdup);
 
+    // Parsing HIJACK vars
+    g_hijack_target = getenv("HIJACK_TARGET");
+    g_hijack_fake = getenv("HIJACK_FAKE");
+    const char* prio_env = getenv("HIJACK_PRIO_TIMESTAMP");
+    if (prio_env && (strcmp(prio_env, "1") == 0 || strcasecmp(prio_env, "true") == 0)) {
+        g_hijack_prio_timestamp = true;
+    }
+
     // Find all real function pointers
     // We set g_dont_fake_stat to prevent dlsym from triggering stat internally.
     g_dont_fake_stat = true;
@@ -178,6 +212,13 @@ static void ft_stat_init(void) {
     real_fxstat = dlsym(RTLD_NEXT, "__fxstat");
     real_fxstatat = dlsym(RTLD_NEXT, "__fxstatat");
     real_statx = dlsym(RTLD_NEXT, "statx");
+
+    real_open = dlsym(RTLD_NEXT, "open");
+    real_open64 = dlsym(RTLD_NEXT, "open64");
+    real_openat = dlsym(RTLD_NEXT, "openat");
+    real_openat64 = dlsym(RTLD_NEXT, "openat64");
+    real_fopen = dlsym(RTLD_NEXT, "fopen");
+    real_fopen64 = dlsym(RTLD_NEXT, "fopen64");
     g_dont_fake_stat = false;
 }
 
@@ -272,6 +313,147 @@ static bool should_fake_path(const char *path) {
     return true; 
 }
 
+/**
+ * Resolve target path to fake path if it matches HIJACK_TARGET
+ */
+static const char* resolve_hijack_path(const char *path, bool *is_hijacked) {
+    *is_hijacked = false;
+    if (!path || !g_hijack_target || !g_hijack_fake) {
+        return path;
+    }
+
+    // Must respect existing white/blacklist logic
+    if (!should_fake_path(path)) {
+        return path;
+    }
+
+    char resolved_buf[PATH_MAX];
+    const char *path_to_check = path; 
+    DONT_FAKE_STAT({
+        if (realpath(path, resolved_buf)) {
+            path_to_check = resolved_buf; 
+        }
+    });
+
+    char pattern_buf[PATH_MAX + 3];
+    snprintf(pattern_buf, sizeof(pattern_buf), "*%s*", g_hijack_target);
+    
+    if (fnmatch(pattern_buf, path_to_check, 0) == 0) {
+        *is_hijacked = true;
+        return g_hijack_fake;
+    }
+
+    return path;
+}
+
+
+// --- Hijack open, openat ---
+
+int open(const char *pathname, int flags, ...) {
+    pthread_once(&g_init_once, ft_stat_init);
+    if (!CHECK_MISSING_REAL(open)) return -1;
+
+    bool is_hijacked;
+    const char *actual_path = resolve_hijack_path(pathname, &is_hijacked);
+
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list args;
+        va_start(args, flags);
+        mode = (mode_t)va_arg(args, int); // mode_t promotes to int
+        va_end(args);
+    }
+
+    int ret;
+    DONT_FAKE_STAT(ret = real_open(actual_path, flags, mode));
+    return ret;
+}
+
+int open64(const char *pathname, int flags, ...) {
+    pthread_once(&g_init_once, ft_stat_init);
+    if (!CHECK_MISSING_REAL(open64)) return -1;
+
+    bool is_hijacked;
+    const char *actual_path = resolve_hijack_path(pathname, &is_hijacked);
+
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list args;
+        va_start(args, flags);
+        mode = (mode_t)va_arg(args, int);
+        va_end(args);
+    }
+
+    int ret;
+    DONT_FAKE_STAT(ret = real_open64(actual_path, flags, mode));
+    return ret;
+}
+
+int openat(int dirfd, const char *pathname, int flags, ...) {
+    pthread_once(&g_init_once, ft_stat_init);
+    if (!CHECK_MISSING_REAL(openat)) return -1;
+
+    bool is_hijacked;
+    const char *actual_path = resolve_hijack_path(pathname, &is_hijacked);
+
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list args;
+        va_start(args, flags);
+        mode = (mode_t)va_arg(args, int);
+        va_end(args);
+    }
+
+    int ret;
+    DONT_FAKE_STAT(ret = real_openat(dirfd, actual_path, flags, mode));
+    return ret;
+}
+
+int openat64(int dirfd, const char *pathname, int flags, ...) {
+    pthread_once(&g_init_once, ft_stat_init);
+    if (!CHECK_MISSING_REAL(openat64)) return -1;
+
+    bool is_hijacked;
+    const char *actual_path = resolve_hijack_path(pathname, &is_hijacked);
+
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list args;
+        va_start(args, flags);
+        mode = (mode_t)va_arg(args, int);
+        va_end(args);
+    }
+
+    int ret;
+    DONT_FAKE_STAT(ret = real_openat64(dirfd, actual_path, flags, mode));
+    return ret;
+}
+
+// --- Hijack fopen, fopen64 ---
+
+FILE *fopen(const char *pathname, const char *mode) {
+    pthread_once(&g_init_once, ft_stat_init);
+    if (!CHECK_MISSING_REAL(fopen)) return NULL;
+
+    bool is_hijacked;
+    const char *actual_path = resolve_hijack_path(pathname, &is_hijacked);
+
+    FILE *ret;
+    DONT_FAKE_STAT(ret = real_fopen(actual_path, mode));
+    return ret;
+}
+
+FILE *fopen64(const char *pathname, const char *mode) {
+    pthread_once(&g_init_once, ft_stat_init);
+    if (!CHECK_MISSING_REAL(fopen64)) return NULL;
+
+    bool is_hijacked;
+    const char *actual_path = resolve_hijack_path(pathname, &is_hijacked);
+
+    FILE *ret;
+    DONT_FAKE_STAT(ret = real_fopen64(actual_path, mode));
+    return ret;
+}
 
 // --- Hijack stat, lstat, fstat, fstatat ---
 
@@ -279,10 +461,17 @@ static bool should_fake_path(const char *path) {
 int __xstat(int ver, const char *path, struct stat *stat_buf) {
     pthread_once(&g_init_once, ft_stat_init);
     if (!CHECK_MISSING_REAL(xstat)) return -1;
+    
+    bool is_hijacked;
+    const char *actual_path = resolve_hijack_path(path, &is_hijacked);
+    
     int ret;
-    DONT_FAKE_STAT(ret = real_xstat(ver, path, stat_buf));
+    DONT_FAKE_STAT(ret = real_xstat(ver, actual_path, stat_buf));
+    
     if (ret == 0 && !g_dont_fake_stat && should_fake_path(path)) {
-        apply_fake_stat(stat_buf);
+        if (!(is_hijacked && g_hijack_prio_timestamp)) {
+            apply_fake_stat(stat_buf);
+        }
     }
     return ret;
 }
@@ -291,21 +480,31 @@ int __xstat(int ver, const char *path, struct stat *stat_buf) {
 int __lxstat(int ver, const char *path, struct stat *stat_buf) {
     pthread_once(&g_init_once, ft_stat_init);
     if (!CHECK_MISSING_REAL(lxstat)) return -1;
+
+    bool is_hijacked;
+    const char *actual_path = resolve_hijack_path(path, &is_hijacked);
+
     int ret;
-    DONT_FAKE_STAT(ret = real_lxstat(ver, path, stat_buf));
+    DONT_FAKE_STAT(ret = real_lxstat(ver, actual_path, stat_buf));
+
     if (ret == 0 && !g_dont_fake_stat && should_fake_path(path)) {
-        apply_fake_stat(stat_buf);
+        if (!(is_hijacked && g_hijack_prio_timestamp)) {
+            apply_fake_stat(stat_buf);
+        }
     }
     return ret;
 }
 
 // Hijack fstat() -> __fxstat()
+// Notice: file content hijack handled by open/openat wrapper.
 int __fxstat(int ver, int fd, struct stat *stat_buf) {
     pthread_once(&g_init_once, ft_stat_init);
     if (!CHECK_MISSING_REAL(fxstat)) return -1;
     int ret;
     DONT_FAKE_STAT(ret = real_fxstat(ver, fd, stat_buf));
     if (ret == 0 && !g_dont_fake_stat && should_fake_path(NULL)) {
+        // Since fxstat uses fd, we cannot easily check path matching without fd mapping tracking.
+        // We apply standard FAKESTAT as a fallback for standard fd queries.
         apply_fake_stat(stat_buf);
     }
     return ret;
@@ -315,10 +514,17 @@ int __fxstat(int ver, int fd, struct stat *stat_buf) {
 int __fxstatat(int ver, int dirfd, const char *path, struct stat *stat_buf, int flags) {
     pthread_once(&g_init_once, ft_stat_init);
     if (!CHECK_MISSING_REAL(fxstatat)) return -1;
+
+    bool is_hijacked;
+    const char *actual_path = resolve_hijack_path(path, &is_hijacked);
+
     int ret;
-    DONT_FAKE_STAT(ret = real_fxstatat(ver, dirfd, path, stat_buf, flags));
+    DONT_FAKE_STAT(ret = real_fxstatat(ver, dirfd, actual_path, stat_buf, flags));
+    
     if (ret == 0 && !g_dont_fake_stat && should_fake_path(path)) {
-        apply_fake_stat(stat_buf);
+        if (!(is_hijacked && g_hijack_prio_timestamp)) {
+            apply_fake_stat(stat_buf);
+        }
     }
     return ret;
 }
@@ -327,10 +533,17 @@ int __fxstatat(int ver, int dirfd, const char *path, struct stat *stat_buf, int 
 int statx(int dirfd, const char *pathname, int flags, unsigned int mask, struct statx *statxbuf) {
     pthread_once(&g_init_once, ft_stat_init);
     if (!CHECK_MISSING_REAL(statx)) return -1;
+
+    bool is_hijacked;
+    const char *actual_path = resolve_hijack_path(pathname, &is_hijacked);
+
     int ret;
-    DONT_FAKE_STAT(ret = real_statx(dirfd, pathname, flags, mask, statxbuf));
+    DONT_FAKE_STAT(ret = real_statx(dirfd, actual_path, flags, mask, statxbuf));
+    
     if (ret == 0 && !g_dont_fake_stat && should_fake_path(pathname)) {
-        apply_fake_statx(statxbuf);
+        if (!(is_hijacked && g_hijack_prio_timestamp)) {
+            apply_fake_statx(statxbuf);
+        }
     }
     return ret;
 }
