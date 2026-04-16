@@ -377,6 +377,88 @@ static bool should_fake_path(const char *path) {
     return true; 
 }
 
+// Current process basename provided by GLIBC
+extern const char *__progname;
+// Process level cache: -1 (uninitialized), 0 (prevent hijacking), 1 (allow hijacking)
+static int g_app_hijack_allowed = -1;
+
+static bool match_app_list(const char *env_var) {
+    const char *env_val = getenv(env_var);
+    if (!env_val || !*env_val) return false;
+
+    // Obtain the real physical absolute path of the current process
+    char exe_path[4096] = {0};
+    ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+    if (len > 0) exe_path[len] = '\0';
+
+    char *list_copy = strdup(env_val);
+    if (!list_copy) return false;
+
+    bool matched = false;
+    char *token = list_copy;
+    char *next;
+
+    while (token && *token) {
+        next = strstr(token, "||");
+        if (next) {
+            *next = '\0';
+            next += 2; // Skip the '| |' delimiter
+        }
+
+        if (*token) {
+            // Core matching logic: supports full path (fnmatch) and partial inclusion (strstr)
+            // Cross compare exe_path (absolute path) with __progname (short process name)
+            if ((len > 0 && fnmatch(token, exe_path, 0) == 0) ||
+                (len > 0 && strstr(exe_path, token) != NULL) ||
+                (__progname && fnmatch(token, __progname, 0) == 0) ||
+                (__progname && strstr(__progname, token) != NULL)) {
+                matched = true;
+                break;
+            }
+        }
+        token = next;
+    }
+    free(list_copy);
+    return matched;
+}
+
+static void init_app_hijack_state() {
+    // Hit cache, directly return (O (1) high-speed path)
+    if (g_app_hijack_allowed != -1) {
+        return;
+    }
+    bool has_wl = getenv("HIJACK_WHITELIST") && *getenv("HIJACK_WHITELIST");
+    bool has_bl = getenv("HIJACK_BLACKLIST") && *getenv("HIJACK_BLACKLIST");
+
+    // 1. Whitelist check (highest priority)
+    if (has_wl && match_app_list("HIJACK_WHITELIST")) {
+        g_app_hijack_allowed = 0; 
+        return;
+    }
+
+    // 2. Blacklist check
+    if (has_bl && match_app_list("HIJACK_BLACKLIST")) {
+        g_app_hijack_allowed = 1; 
+        return;
+    }
+
+    // 3. Whitelist exists but did not hit ->default hijacking
+    if (has_wl) {
+        g_app_hijack_allowed = 1; 
+        return;
+    }
+    
+    // 4. Blacklist exists but did not hit ->default passing
+    if (has_bl) {
+        g_app_hijack_allowed = 0; 
+        return;
+    }
+
+    // 5. Default: hijacking
+    g_app_hijack_allowed = 1; 
+    return;
+}
+
 /**
  * Resolve target path to fake path by matching through mappings
  */
@@ -389,6 +471,13 @@ static const char* resolve_hijack_path(const char *path, bool *is_hijacked) {
     // Must respect existing white/blacklist logic
     if (!should_fake_path(path)) {
         return path;
+    }
+    
+    if (g_app_hijack_allowed == -1) {
+        init_app_hijack_state();
+    }
+    if (g_app_hijack_allowed == 0) {
+        return path; // Hit the release condition, return to the native real path directly
     }
 
     char resolved_buf[PATH_MAX];
