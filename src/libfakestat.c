@@ -27,6 +27,7 @@
  * [e.g.] export HIJACK_TARGET_2="binary2"
  * [e.g.] export HIJACK_FAKE_2="/tmp/fake_dummy2"
  * [e.g.] export HIJACK_PRIO_TIMESTAMP="1" (If 1, returns the real timestamp of HIJACK_FAKE instead of FAKESTAT)
+ * [e.g.] export HIJACK_ALLOW_WRITE="1" (If 1, allows write/create operations to modify the fake file instead of the original)
  */
 
 #define _GNU_SOURCE
@@ -70,6 +71,9 @@ static HijackMapping g_hijack_mappings[MAX_HIJACK_MAPPINGS];
 static int g_hijack_mapping_count = 0;
 
 static bool g_hijack_prio_timestamp = false;
+
+// Global variable: Allow writing to hijacked fake files
+static bool g_hijack_allow_write = false;
 
 // --- Reentrancy protection ---
 // (preventing __xstat -> real_xstat -> ... -> __xstat)
@@ -232,6 +236,12 @@ static void ft_stat_init(void) {
     const char* prio_env = getenv("HIJACK_PRIO_TIMESTAMP");
     if (prio_env && (strcmp(prio_env, "1") == 0 || strcasecmp(prio_env, "true") == 0)) {
         g_hijack_prio_timestamp = true;
+    }
+
+    // Check the write control options
+    const char* allow_write_env = getenv("HIJACK_ALLOW_WRITE");
+    if (allow_write_env && (strcmp(allow_write_env, "1") == 0 || strcasecmp(allow_write_env, "true") == 0)) {
+        g_hijack_allow_write = true;
     }
 
     g_hijack_mapping_count = 0;
@@ -412,6 +422,11 @@ int open(const char *pathname, int flags, ...) {
     bool is_hijacked;
     const char *actual_path = resolve_hijack_path(pathname, &is_hijacked);
 
+    // Determine if there is a write intent. If it is a write and the allow_write option is not enabled, force a rollback to the original path
+    if (((flags & O_ACCMODE) != O_RDONLY || (flags & O_CREAT) || (flags & O_TRUNC) || (flags & O_APPEND)) && !g_hijack_allow_write) {
+        actual_path = pathname;
+    }
+
     mode_t mode = 0;
     if (flags & O_CREAT) {
         va_list args;
@@ -431,6 +446,10 @@ int open64(const char *pathname, int flags, ...) {
 
     bool is_hijacked;
     const char *actual_path = resolve_hijack_path(pathname, &is_hijacked);
+
+    if (((flags & O_ACCMODE) != O_RDONLY || (flags & O_CREAT) || (flags & O_TRUNC) || (flags & O_APPEND)) && !g_hijack_allow_write) {
+        actual_path = pathname;
+    }
 
     mode_t mode = 0;
     if (flags & O_CREAT) {
@@ -452,6 +471,10 @@ int openat(int dirfd, const char *pathname, int flags, ...) {
     bool is_hijacked;
     const char *actual_path = resolve_hijack_path(pathname, &is_hijacked);
 
+    if (((flags & O_ACCMODE) != O_RDONLY || (flags & O_CREAT) || (flags & O_TRUNC) || (flags & O_APPEND)) && !g_hijack_allow_write) {
+        actual_path = pathname;
+    }
+
     mode_t mode = 0;
     if (flags & O_CREAT) {
         va_list args;
@@ -471,6 +494,10 @@ int openat64(int dirfd, const char *pathname, int flags, ...) {
 
     bool is_hijacked;
     const char *actual_path = resolve_hijack_path(pathname, &is_hijacked);
+
+    if (((flags & O_ACCMODE) != O_RDONLY || (flags & O_CREAT) || (flags & O_TRUNC) || (flags & O_APPEND)) && !g_hijack_allow_write) {
+        actual_path = pathname;
+    }
 
     mode_t mode = 0;
     if (flags & O_CREAT) {
@@ -494,6 +521,10 @@ FILE *fopen(const char *pathname, const char *mode) {
     bool is_hijacked;
     const char *actual_path = resolve_hijack_path(pathname, &is_hijacked);
 
+    if (mode && (strchr(mode, 'w') || strchr(mode, 'a') || strchr(mode, '+')) && !g_hijack_allow_write) {
+        actual_path = pathname;
+    }
+
     FILE *ret;
     DONT_FAKE_STAT(ret = real_fopen(actual_path, mode));
     return ret;
@@ -505,6 +536,10 @@ FILE *fopen64(const char *pathname, const char *mode) {
 
     bool is_hijacked;
     const char *actual_path = resolve_hijack_path(pathname, &is_hijacked);
+
+    if (mode && (strchr(mode, 'w') || strchr(mode, 'a') || strchr(mode, '+')) && !g_hijack_allow_write) {
+        actual_path = pathname;
+    }
 
     FILE *ret;
     DONT_FAKE_STAT(ret = real_fopen64(actual_path, mode));
