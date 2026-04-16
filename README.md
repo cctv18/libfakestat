@@ -59,6 +59,7 @@
 - 多组映射劫持：
 - `HIJACK_TARGET_1="$(pwd)/clang" HIJACK_FAKE_1="/home/ubuntu/bin/clang" HIJACK_TARGET_2="$(pwd)/ld.lld" HIJACK_FAKE_2="/home/ubuntu/bin/ld.lld" LD_PRELOAD="./libfakestat.so stat ./clang`
 - 多组映射劫持以`_n`的形式对`HIJACK_TARGET`和`HIJACK_FAKE`进行分组，最高支持1024组，且编号越小的映射规则优先级越高。
+- 从v0.5起，引入了文件劫持读写区分控制，默认对被劫持文件的写入操作**只写入被劫持文件自身**（保护重定向目标文件不被改写），只有在开启 `HIJACK_ALLOW_WRITE=1` 时才允许写入重定向目标文件。
 - **与`libfaketime`合用**
 - 使用例如下：  
 `FAKETIME="@2024-05-26 12:34:56" FAKESTAT="2025-05-25 11:45:14" LD_PRELOAD="./libfakestat.so ./libfaketime.so" bash build.sh`
