@@ -22,6 +22,9 @@ jobs:
           ccache 2>&1 | tee
           libssl-dev 2>&1 | tee
           libelf-dev 2>&1 | tee
+          sudo apt update
+          sudo apt install ccache
+          ccache -V
           make
           tar -czf libfakestat.tar.gz *.so
 
@@ -64,6 +67,6 @@ jobs:
             ### 更新内容：
             - (预留)
           draft: false
-          prerelease: false
+          prerelease: true
           files: |
             release_files/*.tar.gz
